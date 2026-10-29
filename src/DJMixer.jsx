@@ -652,6 +652,84 @@ async function detectTempo(buffer) {
   return { bpm: Math.round(bpm * 10) / 10, offset: start + bestPhase / fps }
 }
 
+// Portada incrustada en el archivo: ID3v2 (MP3), FLAC y MP4/M4A
+const revokeCover = (url) => url?.startsWith('blob:') && URL.revokeObjectURL(url)
+
+function extractCover(ab) {
+  const u8 = new Uint8Array(ab)
+  const str = (o, n) => String.fromCharCode(...u8.subarray(o, o + n))
+  const u32 = (o) => ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0
+  const blob = (o, n, mime) => (n > 0 && o + n <= u8.length ? new Blob([u8.slice(o, o + n)], { type: mime || sniff(o) }) : null)
+  const sniff = (o) => (u8[o] === 0x89 && u8[o + 1] === 0x50 ? 'image/png' : 'image/jpeg')
+
+  if (str(0, 3) === 'ID3') {
+    const v = u8[3]
+    const syncsafe = (o) => (u8[o] << 21) | (u8[o + 1] << 14) | (u8[o + 2] << 7) | u8[o + 3]
+    const end = 10 + syncsafe(6)
+    let o = 10
+    if (u8[5] & 0x40 && v >= 3) o += v === 4 ? syncsafe(10) : u32(10) + 4
+    while (o + 10 < end && u8[o]) {
+      const v2 = v === 2
+      const id = str(o, v2 ? 3 : 4)
+      const size = v2 ? (u8[o + 3] << 16) | (u8[o + 4] << 8) | u8[o + 5] : v === 4 ? syncsafe(o + 4) : u32(o + 4)
+      const body = o + (v2 ? 6 : 10)
+      if (id === 'APIC' || id === 'PIC') {
+        const enc = u8[body]
+        let p = body + 1
+        let mime = ''
+        if (v2) {
+          mime = str(p, 3).toLowerCase() === 'png' ? 'image/png' : 'image/jpeg'
+          p += 3
+        } else {
+          while (u8[p]) mime += String.fromCharCode(u8[p++])
+          p++
+          if (!mime.includes('/')) mime = 'image/' + (mime.toLowerCase() || 'jpeg')
+        }
+        p++ // tipo de imagen
+        if (enc === 1 || enc === 2) {
+          while (p + 1 < body + size && (u8[p] || u8[p + 1])) p += 2
+          p += 2
+        } else {
+          while (p < body + size && u8[p]) p++
+          p++
+        }
+        return blob(p, body + size - p, mime)
+      }
+      o = body + size
+    }
+    return null
+  }
+
+  if (str(0, 4) === 'fLaC') {
+    let o = 4
+    for (;;) {
+      const last = u8[o] & 0x80
+      const type = u8[o] & 0x7f
+      const len = (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]
+      const b = o + 4
+      if (type === 6) {
+        let p = b + 4
+        const ml = u32(p)
+        const mime = str(p + 4, ml)
+        p += 4 + ml
+        p += 4 + u32(p) + 16
+        return blob(p + 4, u32(p), mime)
+      }
+      if (last || b + len >= u8.length) return null
+      o = b + len
+    }
+  }
+
+  // MP4: átomo moov/udta/meta/ilst/covr/data (busca la firma directamente)
+  for (let i = 4; i < u8.length - 24; i++) {
+    if (u8[i] === 0x63 && str(i, 4) === 'covr' && str(i + 8, 4) === 'data') {
+      const size = u32(i + 4)
+      return blob(i + 20, size - 16, u8[i + 15] === 14 ? 'image/png' : 'image/jpeg')
+    }
+  }
+  return null
+}
+
 // ─── Motor de audio ──────────────────────────────────────────────────────────
 class Engine {
   constructor() {
@@ -1111,7 +1189,7 @@ function Waveform({ deck, peaks, color }) {
   )
 }
 
-function Platter({ deck, color, playing, label }) {
+function Platter({ deck, color, playing, label, cover }) {
   const disc = useRef(null)
   const drag = useRef(null)
   useFrame(() => {
@@ -1153,15 +1231,31 @@ function Platter({ deck, color, playing, label }) {
       onPointerUp={end}
       onPointerCancel={end}
     >
-      <div ref={disc} className="vinyl relative h-full w-full rounded-full">
-        <div
+      <div ref={disc} className="vinyl relative h-full w-full overflow-hidden rounded-full">
+        {cover && (
+          <>
+            <img src={cover} alt="" draggable="false" className="absolute inset-0 h-full w-full object-cover" />
+            {/* Surcos del vinilo sobre la portada */}
+            <span className="absolute inset-0 rounded-full" style={{ background: 'repeating-radial-gradient(circle, rgba(0,0,0,.22) 0 1px, transparent 1px 3px)', maskImage: 'radial-gradient(circle, transparent 0 17%, #000 18%)', WebkitMaskImage: 'radial-gradient(circle, transparent 0 17%, #000 18%)' }} />
+            <span className="absolute left-1/2 top-1/2 aspect-square w-[36%] -translate-x-1/2 -translate-y-1/2 rounded-full" style={{ boxShadow: `0 0 0 2px rgba(0,0,0,.55), 0 0 0 3px ${color}66` }} />
+            <span className="absolute left-1/2 top-1/2 aspect-square w-[5%] -translate-x-1/2 -translate-y-1/2 rounded-full bg-carbon-900 shadow-[0_0_0_2px_rgba(255,255,255,.25)]" />
+          </>
+        )}
+        {!cover && <div
           className="absolute left-1/2 top-1/2 flex aspect-square w-[34%] -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full"
           style={{ background: `radial-gradient(circle, #0b0b0d 0 9%, ${color} 10% 100%)`, boxShadow: playing ? `0 0 18px ${color}` : 'none' }}
         >
           <span className="absolute top-[14%] font-display text-[10px] font-bold tracking-widest text-black/80">{label}</span>
-        </div>
-        <span className="absolute left-1/2 top-[3%] h-[16%] w-[3px] -translate-x-1/2 rounded-full bg-white/80" />
+        </div>}
+        <span className="absolute left-1/2 top-[3%] h-[16%] w-[3px] -translate-x-1/2 rounded-full bg-white/80 shadow-[0_0_4px_rgba(0,0,0,.8)]" />
       </div>
+      {cover && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-[6px] rounded-full"
+          style={{ background: 'conic-gradient(from 200deg, transparent 0 8%, rgba(255,255,255,.16) 12%, transparent 18% 58%, rgba(255,255,255,.1) 62%, transparent 68%)', boxShadow: 'inset 0 0 0 3px rgba(0,0,0,.6), inset 0 0 22px rgba(0,0,0,.6)' }}
+        />
+      )}
     </div>
   )
 }
@@ -1172,6 +1266,7 @@ function Icon({ name, className = 'h-5 w-5' }) {
     pause: <path d="M6 4.5h4.5v15H6zm7.5 0H18v15h-4.5z" fill="currentColor" />,
     upload: <path d="M12 3l5 5h-3.2v6h-3.6V8H7zM4.5 17.5h15v3h-15z" fill="currentColor" />,
     search: <path d="M10.5 3a7.5 7.5 0 0 1 6 12l4.3 4.3-1.8 1.8-4.3-4.3A7.5 7.5 0 1 1 10.5 3zm0 2.5a5 5 0 1 0 0 10 5 5 0 0 0 0-10z" fill="currentColor" />,
+    image: <path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 2v9.6l4-4 3.5 3.5 2.5-2.5 4 4V6zm10.5 1.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4z" fill="currentColor" fillRule="evenodd" />,
     reset: <path d="M12 5a7 7 0 1 1-6.6 9.3l2.3-.8A4.6 4.6 0 1 0 12 7.4V10L7.5 6.2 12 2.5z" fill="currentColor" />,
   }
   return (
@@ -1320,7 +1415,7 @@ function AudiusSearch({ deck, color, onPick, onClose }) {
   )
 }
 
-function Deck({ id, info, onLoadFile, onPickAudius }) {
+function Deck({ id, info, onLoadFile, onPickAudius, onCover }) {
   useEngineTick()
   const engine = getEngine()
   const d = engine.decks[id]
@@ -1456,8 +1551,27 @@ function Deck({ id, info, onLoadFile, onPickAudius }) {
       <Waveform deck={id} peaks={info.peaks} color={color} />
 
       <div className="flex items-center gap-4">
-        <div className="flex flex-1 justify-center">
-          <Platter deck={id} color={color} playing={d.playing} label={`DECK ${id}`} />
+        <div className="relative flex flex-1 justify-center">
+          <Platter deck={id} color={color} playing={d.playing} label={`DECK ${id}`} cover={info.cover} />
+          <label
+            htmlFor={`cover-file-${id}`}
+            className="hw-btn absolute bottom-0 left-0 grid h-9 w-9 cursor-pointer place-items-center text-carbon-300 hover:text-white"
+            title={info.cover ? 'Cambiar la portada del disco' : 'Subir una portada para el disco'}
+          >
+            <Icon name="image" className="h-4 w-4" />
+            <span className="sr-only">{info.cover ? 'Cambiar portada' : 'Subir portada'} del deck {id}</span>
+          </label>
+          <input
+            id={`cover-file-${id}`}
+            type="file"
+            accept="image/*"
+            className="sr-only"
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) onCover(id, f)
+              e.target.value = ''
+            }}
+          />
         </div>
         <div className="flex flex-col items-center gap-1.5">
           <span className="silk !text-[9px]">+8%</span>
@@ -2021,14 +2135,30 @@ export default function DJMixer() {
     setDecks((s) => ({ ...s, [id]: { ...s[id], bpm: tempo?.bpm ?? null, analyzing: false } }))
   }
 
+  const setCover = (id, file) =>
+    setDecks((s) => {
+      revokeCover(s[id].cover)
+      return { ...s, [id]: { ...s[id], cover: URL.createObjectURL(file) } }
+    })
+
   const loadFile = async (id, file) => {
     const turn = ++loadTurn.current[id]
     setDecks((s) => ({ ...s, [id]: { ...s[id], loading: true, error: null } }))
     try {
-      const buffer = await engine.ctx.decodeAudioData(await file.arrayBuffer())
+      const bytes = await file.arrayBuffer()
+      let art = null
+      try {
+        art = extractCover(bytes)
+      } catch {
+        /* metadatos dañados: seguimos sin portada */
+      }
+      const buffer = await engine.ctx.decodeAudioData(bytes)
       if (loadTurn.current[id] !== turn) return
       engine.load(id, buffer)
-      setDecks((s) => ({ ...s, [id]: { name: file.name.replace(/\.[^.]+$/, ''), demo: false, bpm: null, analyzing: true, loading: false, peaks: computePeaks(buffer) } }))
+      setDecks((s) => {
+        revokeCover(s[id].cover)
+        return { ...s, [id]: { name: file.name.replace(/\.[^.]+$/, ''), demo: false, bpm: null, analyzing: true, loading: false, peaks: computePeaks(buffer), cover: art ? URL.createObjectURL(art) : null } }
+      })
       analyze(id, buffer, turn)
     } catch {
       setDecks((s) => ({ ...s, [id]: { ...s[id], loading: false, error: `No se pudo leer “${file.name}”. Prueba con MP3, WAV, OGG o M4A.` } }))
@@ -2046,6 +2176,7 @@ export default function DJMixer() {
       setDecks((s) => ({
         ...s,
         [id]: {
+          cover: track.artwork?.['480x480'] || track.artwork?.['1000x1000'] || track.artwork?.['150x150'] || null,
           name: `${track.title} · ${track.user?.name ?? ''}`,
           demo: false,
           bpm: null,
@@ -2104,9 +2235,9 @@ export default function DJMixer() {
       </header>
 
       <div className="grid gap-4 sm:gap-5 lg:grid-cols-[minmax(0,1fr)_300px_minmax(0,1fr)]">
-        <Deck id="A" info={decks.A} onLoadFile={loadFile} onPickAudius={loadAudius} />
+        <Deck id="A" info={decks.A} onLoadFile={loadFile} onPickAudius={loadAudius} onCover={setCover} />
         <Mixer />
-        <Deck id="B" info={decks.B} onLoadFile={loadFile} onPickAudius={loadAudius} />
+        <Deck id="B" info={decks.B} onLoadFile={loadFile} onPickAudius={loadAudius} onCover={setCover} />
       </div>
 
       <Sampler pads={pads} setPads={setPads} />
