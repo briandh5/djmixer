@@ -752,6 +752,8 @@ class Engine {
     this.decks = { A: this.makeDeck(), B: this.makeDeck() }
     this.padSources = {}
     this.listeners = new Set()
+    this.xfListeners = new Set()
+    this.xfManualAt = 0
     this.setXf(0.5)
   }
 
@@ -776,7 +778,7 @@ class Engine {
     input.connect(low).connect(mid).connect(high).connect(vol)
     vol.connect(an)
     vol.connect(xf).connect(this.master)
-    return { input, eq: { low, mid, high }, vol, xf, an, buffer: null, playing: false, offset: 0, startedAt: 0, rate: 1, bend: 1, curRate: 1, source: null, cue: 0, tempo: null }
+    return { input, eq: { low, mid, high }, vol, xf, an, buffer: null, playing: false, offset: 0, startedAt: 0, rate: 1, bend: 1, curRate: 1, source: null, cue: 0, tempo: null, meta: null }
   }
 
   on(fn) {
@@ -874,7 +876,10 @@ class Engine {
   setVol(id, v) {
     this.decks[id].vol.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02)
   }
-  setXf(x) {
+  setXf(x, manual = false) {
+    this.xf = x
+    if (manual) this.xfManualAt = performance.now()
+    for (const fn of this.xfListeners) fn(x)
     const t = this.ctx.currentTime
     this.decks.A.xf.gain.setTargetAtTime(Math.cos((x * Math.PI) / 2), t, 0.01)
     this.decks.B.xf.gain.setTargetAtTime(Math.sin((x * Math.PI) / 2), t, 0.01)
@@ -1320,6 +1325,30 @@ async function audiusBuffer(track, ctx, onProgress) {
   return ctx.decodeAudioData(bytes)
 }
 
+// Auto DJ: busca en Audius una canción con el mismo género y mood, y BPM cercano
+async function audiusNext(meta, bpm, exclude) {
+  const genre = meta?.genre || 'Electronic'
+  const urls = [`${AUDIUS_API}/tracks/trending?genre=${encodeURIComponent(genre)}&time=month&app_name=${AUDIUS_APP}`]
+  if (meta?.mood) urls.push(`${AUDIUS_API}/tracks/search?query=${encodeURIComponent(`${meta.mood} ${genre}`)}&app_name=${AUDIUS_APP}`)
+  const lists = await Promise.allSettled(urls.map((u) => fetch(u).then((r) => (r.ok ? r.json() : { data: [] }))))
+  if (lists.every((r) => r.status === 'rejected')) throw new TypeError('sin conexión')
+  const seen = new Set()
+  const pool = lists
+    .flatMap((r) => (r.status === 'fulfilled' ? r.value.data || [] : []))
+    .filter((t) => t.is_streamable !== false && !exclude.has(t.id) && t.duration >= 90 && !seen.has(t.id) && seen.add(t.id))
+  const score = (t) => {
+    let sc = Math.random()
+    if (t.genre === genre) sc += 2
+    if (meta?.mood && t.mood === meta.mood) sc += 2
+    if (bpm && t.bpm) {
+      const dist = Math.min(...[t.bpm, t.bpm * 2, t.bpm / 2].map((b) => Math.abs(b - bpm) / bpm))
+      sc += dist < 0.04 ? 3 : dist < 0.08 ? 1.5 : 0
+    }
+    return sc
+  }
+  return pool.map((t) => [score(t), t]).sort((a, b) => b[0] - a[0])[0]?.[1] ?? null
+}
+
 function AudiusSearch({ deck, color, onPick, onClose }) {
   const [q, setQ] = useState('')
   const [shown, setShown] = useState('')
@@ -1420,14 +1449,14 @@ function Deck({ id, info, onLoadFile, onPickAudius, onCover }) {
   const engine = getEngine()
   const d = engine.decks[id]
   const color = DECK_COLOR[id]
-  const [pitch, setPitch] = useState(0.5)
   const [over, setOver] = useState(false)
   const [searching, setSearching] = useState(false)
   const closeSearch = useCallback(() => setSearching(false), [])
   const elapsed = useRef(null)
   const remain = useRef(null)
   const preview = useRef(false)
-  const rate = 1 + (pitch - 0.5) * 0.16
+  const rate = d.rate
+  const pitch = (rate - 1) / 0.16 + 0.5
 
   useFrame(() => {
     const p = engine.pos(id)
@@ -1437,8 +1466,8 @@ function Deck({ id, info, onLoadFile, onPickAudius, onCover }) {
   })
 
   const changePitch = (v) => {
-    setPitch(v)
     engine.setRate(id, 1 + (v - 0.5) * 0.16, null)
+    engine.emit()
   }
 
   const cueDown = () => {
@@ -1681,9 +1710,13 @@ function Channel({ id }) {
   )
 }
 
-function Mixer() {
+function Mixer({ auto, onToggleAuto, autoStatus }) {
   const engine = getEngine()
-  const [xf, setXf] = useState(0.5)
+  const [xf, setXf] = useState(engine.xf)
+  useEffect(() => {
+    engine.xfListeners.add(setXf)
+    return () => engine.xfListeners.delete(setXf)
+  }, [engine])
   const [master, setMaster] = useState(0.9)
   return (
     <section className="panel flex flex-col gap-5 p-5 sm:p-6 lg:w-[300px]" aria-label="Mixer">
@@ -1729,12 +1762,24 @@ function Mixer() {
           ticks={11}
           color="#ffffff"
           ariaText={xf < 0.48 ? `Hacia A ${Math.round((1 - xf) * 100)}%` : xf > 0.52 ? `Hacia B ${Math.round(xf * 100)}%` : 'Centro'}
-          onChange={(v) => {
-            setXf(v)
-            engine.setXf(v)
-          }}
+          onChange={(v) => engine.setXf(v, true)}
         />
         <p className="text-center text-[11px] text-carbon-400">Curva de potencia constante: en el centro ambas suenan a −3 dB.</p>
+      </div>
+      <div className="flex flex-col gap-2 border-t border-carbon-600 pt-4">
+        <button
+          type="button"
+          onClick={onToggleAuto}
+          aria-pressed={auto}
+          className="hw-btn flex h-11 items-center justify-center gap-2 font-display text-xs font-bold uppercase tracking-[.2em]"
+          style={auto ? { color: '#050506', background: NEON.green, borderColor: NEON.green, boxShadow: `0 0 20px ${NEON.green}88, 0 3px 0 #08080a` } : { color: NEON.green }}
+        >
+          <span className="h-2 w-2 rounded-full" style={{ background: auto ? '#050506' : NEON.green }} />
+          Auto DJ {auto ? 'activo' : ''}
+        </button>
+        <p className="min-h-[2.5em] text-center text-[11px] leading-snug text-carbon-300" role="status">
+          {auto ? autoStatus : 'Elige la siguiente canción según el estilo de la que suena y hace el crossfade solo.'}
+        </p>
       </div>
     </section>
   )
@@ -2070,13 +2115,20 @@ function BeatBackdrop({ enabled }) {
   return <canvas ref={canvas} aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 h-full w-full" />
 }
 
+const DEMO_NAMES = { A: 'Neón Nocturno', B: 'Carbón 124' }
+
 export default function DJMixer() {
   const engine = getEngine()
   const [decks, setDecks] = useState({
-    A: { name: 'Neón Nocturno', demo: true, bpm: BPM, loading: true },
-    B: { name: 'Carbón 124', demo: true, bpm: BPM, loading: true },
+    A: { name: DEMO_NAMES.A, demo: true, bpm: BPM, loading: true },
+    B: { name: DEMO_NAMES.B, demo: true, bpm: BPM, loading: true },
   })
   const [pads, setPads] = useState({})
+  const [auto, setAuto] = useState(false)
+  const [autoStatus, setAutoStatus] = useState('')
+  const autoRun = useRef(null)
+  const played = useRef(new Set())
+  const demoBufs = useRef({})
   const [running, setRunning] = useState(engine.ctx.state === 'running')
   const [lights, setLights] = useState(() => {
     try {
@@ -2102,8 +2154,12 @@ export default function DJMixer() {
     Promise.all([demoA(), demoB()]).then(([a, b]) => {
       if (!alive) return
       for (const [id, buf] of [['A', a], ['B', b]]) {
-        if (!engine.decks[id].buffer) engine.load(id, buf, { bpm: BPM, offset: 0 })
+        if (!engine.decks[id].buffer) {
+          engine.load(id, buf, { bpm: BPM, offset: 0 })
+          engine.decks[id].meta = { source: 'demo', which: id }
+        }
       }
+      demoBufs.current = { A: a, B: b }
       setDecks((s) => ({
         A: { ...s.A, loading: false, peaks: computePeaks(engine.decks.A.buffer) },
         B: { ...s.B, loading: false, peaks: computePeaks(engine.decks.B.buffer) },
@@ -2155,6 +2211,7 @@ export default function DJMixer() {
       const buffer = await engine.ctx.decodeAudioData(bytes)
       if (loadTurn.current[id] !== turn) return
       engine.load(id, buffer)
+      engine.decks[id].meta = { source: 'file' }
       setDecks((s) => {
         revokeCover(s[id].cover)
         return { ...s, [id]: { name: file.name.replace(/\.[^.]+$/, ''), demo: false, bpm: null, analyzing: true, loading: false, peaks: computePeaks(buffer), cover: art ? URL.createObjectURL(art) : null } }
@@ -2171,8 +2228,10 @@ export default function DJMixer() {
     setDecks((s) => ({ ...s, [id]: { ...s[id], loading: true, progress: 0, error: null } }))
     try {
       const buffer = await audiusBuffer(track, engine.ctx, (p) => current() && setDecks((s) => ({ ...s, [id]: { ...s[id], progress: p } })))
-      if (!current()) return
+      if (!current()) return false
       engine.load(id, buffer)
+      engine.decks[id].meta = { source: 'audius', id: track.id, genre: track.genre, mood: track.mood }
+      played.current.add(track.id)
       setDecks((s) => ({
         ...s,
         [id]: {
@@ -2186,13 +2245,140 @@ export default function DJMixer() {
           link: track.permalink ? `https://audius.co${track.permalink}` : 'https://audius.co',
         },
       }))
-      analyze(id, buffer, turn)
+      await analyze(id, buffer, turn)
+      return current()
     } catch (e) {
-      if (!current()) return
+      if (!current()) return false
       const error = e instanceof TypeError ? AUDIUS_OFFLINE : `No se pudo cargar “${track.title}” desde Audius. Prueba con otra canción.`
       setDecks((s) => ({ ...s, [id]: { ...s[id], loading: false, progress: null, error } }))
+      return false
     }
   }
+
+  const loadDemo = (id, which) => {
+    const buf = demoBufs.current[which]
+    if (!buf) return false
+    ++loadTurn.current[id]
+    engine.load(id, buf, { bpm: BPM, offset: 0 })
+    engine.decks[id].meta = { source: 'demo', which }
+    setDecks((s) => {
+      revokeCover(s[id].cover)
+      return { ...s, [id]: { name: DEMO_NAMES[which], demo: true, bpm: BPM, loading: false, peaks: computePeaks(buf) } }
+    })
+    return true
+  }
+
+  // ─── Auto DJ ───
+  // Cuando la canción actual está por acabar, carga una parecida en el otro deck,
+  // iguala el tempo, entra al inicio de un compás y hace el crossfade.
+  const loaders = useRef({})
+  loaders.current = { loadAudius, loadDemo }
+  useEffect(() => {
+    if (!auto) return
+    const st = { phase: 'idle' }
+    autoRun.current = st
+    let last = ''
+    const say = (m) => m !== last && setAutoStatus((last = m))
+    const remainOf = (id) => {
+      const d = engine.decks[id]
+      return d.buffer ? (d.buffer.duration - engine.pos(id)) / (d.rate * d.bend) : 0
+    }
+
+    const prepare = async (cur, other, bpm) => {
+      engine.pause(other)
+      const meta = engine.decks[cur].meta || {}
+      let ok = false
+      try {
+        say(`Buscando en Audius algo parecido${meta.genre ? ` (${meta.genre}${meta.mood ? `, ${meta.mood}` : ''})` : ''}…`)
+        const t = await audiusNext(meta, bpm, played.current)
+        if (autoRun.current !== st) return
+        if (t) {
+          say(`Cargando “${t.title}” en el deck ${other}…`)
+          ok = await loaders.current.loadAudius(other, t)
+          st.title = t.title
+        }
+      } catch {
+        /* sin conexión: seguimos con una pista demo */
+      }
+      if (autoRun.current !== st) return
+      if (!ok) {
+        const which = meta.source === 'demo' && meta.which === 'A' ? 'B' : 'A'
+        ok = loaders.current.loadDemo(other, which)
+        st.title = `${DEMO_NAMES[which]} (demo)`
+      }
+      st.phase = ok ? 'ready' : 'failed'
+    }
+
+    const tick = () => {
+      if (st.phase === 'mixing') {
+        if (engine.xfManualAt > st.startedAt) {
+          st.phase = 'idle'
+          say('Tomaste el crossfader: la mezcla sigue en tus manos.')
+          return
+        }
+        const k = Math.min(1, (performance.now() - st.startedAt) / 1000 / st.len)
+        engine.setXf(st.from + (st.to - st.from) * k * k * (3 - 2 * k))
+        say(`Mezclando ${st.cur} → ${st.next} · ${Math.round(k * 100)}%`)
+        if (k >= 1 || !engine.decks[st.next].playing) {
+          engine.pause(st.cur)
+          Object.assign(st, { phase: 'idle', cur: st.next })
+        }
+        return
+      }
+      const playing = ['A', 'B'].filter((id) => engine.decks[id].playing)
+      const cur = st.cur && engine.decks[st.cur].playing ? st.cur : playing.length === 2 ? (engine.xf < 0.5 ? 'A' : 'B') : playing[0]
+      if (st.phase === 'ready' && !cur && st.cur && remainOf(st.cur) < 0.5) {
+        // La canción se acabó antes de la mezcla: entra la siguiente directo
+        engine.play(st.next)
+        engine.setXf(st.next === 'B' ? 1 : 0)
+        Object.assign(st, { phase: 'idle', cur: st.next })
+        return
+      }
+      if (!cur) {
+        if (st.phase === 'idle') say('Pon play en un deck y Auto DJ elegirá la que sigue.')
+        return
+      }
+      const other = cur === 'A' ? 'B' : 'A'
+      const d = engine.decks[cur]
+      const bpm = d.tempo ? d.tempo.bpm * d.rate : null
+      const mixLen = bpm ? (32 * 60) / bpm : 14
+      const remain = remainOf(cur)
+      if (st.phase === 'idle') {
+        st.cur = cur
+        if (remain < mixLen + 45) {
+          Object.assign(st, { phase: 'preparing', next: other })
+          prepare(cur, other, bpm)
+        } else say(`Escuchando el deck ${cur}. Elijo la siguiente en ${fmt(remain - mixLen - 45).slice(0, -2)}.`)
+        return
+      }
+      if (st.phase === 'failed') return say('No encontré una canción para seguir. Carga una tú en el otro deck.')
+      if (st.phase !== 'ready') return
+      if (st.cur !== cur) return Object.assign(st, { phase: 'idle' })
+      say(`Sigue: ${st.title} (deck ${other}). Mezcla en ${fmt(Math.max(0, remain - mixLen)).slice(0, -2)}.`)
+      if (remain > mixLen) return
+      // Entrar justo al inicio de un compás de la canción actual
+      if (d.tempo && remain > mixLen - 3) {
+        const beat = ((engine.pos(cur) - d.tempo.offset) * d.tempo.bpm) / 60
+        if (beat - 4 * Math.floor(beat / 4) > 0.15) return
+      }
+      const n = engine.decks[other]
+      if (n.tempo && bpm) {
+        let target = n.tempo.bpm
+        if (Math.abs(target * 2 - bpm) < Math.abs(target - bpm)) target *= 2
+        if (Math.abs(target / 2 - bpm) < Math.abs(target - bpm)) target /= 2
+        engine.setRate(other, clamp(bpm / target, 0.92, 1.08), null)
+      }
+      engine.seek(other, n.tempo ? n.tempo.offset : 0)
+      engine.play(other)
+      engine.emit()
+      Object.assign(st, { phase: 'mixing', startedAt: performance.now(), len: Math.max(3, Math.min(mixLen, remain)), from: engine.xf, to: other === 'B' ? 1 : 0 })
+    }
+    const timer = setInterval(tick, 50)
+    return () => {
+      clearInterval(timer)
+      autoRun.current = null
+    }
+  }, [auto, engine])
 
   return (
     <>
@@ -2236,7 +2422,7 @@ export default function DJMixer() {
 
       <div className="grid gap-4 sm:gap-5 lg:grid-cols-[minmax(0,1fr)_300px_minmax(0,1fr)]">
         <Deck id="A" info={decks.A} onLoadFile={loadFile} onPickAudius={loadAudius} onCover={setCover} />
-        <Mixer />
+        <Mixer auto={auto} onToggleAuto={() => setAuto((a) => !a)} autoStatus={autoStatus} />
         <Deck id="B" info={decks.B} onLoadFile={loadFile} onPickAudius={loadAudius} onCover={setCover} />
       </div>
 
